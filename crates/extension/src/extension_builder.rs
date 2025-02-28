@@ -5,28 +5,17 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use futures::io::BufReader;
-use futures::AsyncReadExt;
 use http_client::{self, AsyncBody, HttpClient};
 use serde::Deserialize;
 use std::{
-    env, fs, mem,
+    env, fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
-use wasm_encoder::{ComponentSectionId, Encode as _, RawSection, Section as _};
-use wasmparser::Parser;
-use wit_component::ComponentEncoder;
 
-/// Currently, we compile with Rust's `wasm32-wasip1` target, which works with WASI `preview1`.
-/// But the WASM component model is based on WASI `preview2`. So we need an 'adapter' WASM
-/// module, which implements the `preview1` interface in terms of `preview2`.
-///
-/// Once Rust 1.78 is released, there will be a `wasm32-wasip2` target available, so we will
-/// not need the adapter anymore.
-const RUST_TARGET: &str = "wasm32-wasip1";
-const WASI_ADAPTER_URL: &str =
-    "https://github.com/bytecodealliance/wasmtime/releases/download/v18.0.2/wasi_snapshot_preview1.reactor.wasm";
+/// We compile with Rust's `wasm32-wasip2` target, which supports the WASM component model.
+const RUST_TARGET: &str = "wasm32-wasip2";
 
 /// Compiling Tree-sitter parsers from C to WASM requires Clang 17, and a WASM build of libc
 /// and clang's runtime library. The `wasi-sdk` provides these binaries.
@@ -121,7 +110,6 @@ impl ExtensionBuilder {
         options: CompileExtensionOptions,
     ) -> Result<(), anyhow::Error> {
         self.install_rust_wasm_target_if_needed()?;
-        let adapter_bytes = self.install_wasi_preview1_adapter_if_needed().await?;
 
         let cargo_toml_content = fs::read_to_string(extension_dir.join("Cargo.toml"))?;
         let cargo_toml: CargoToml = toml::from_str(&cargo_toml_content)?;
@@ -165,27 +153,9 @@ impl ExtensionBuilder {
         ]);
         wasm_path.set_extension("wasm");
 
-        let wasm_bytes = fs::read(&wasm_path)
-            .with_context(|| format!("failed to read output module `{}`", wasm_path.display()))?;
-
-        let mut encoder = ComponentEncoder::default()
-            .module(&wasm_bytes)?
-            .adapter("wasi_snapshot_preview1", &adapter_bytes)
-            .context("failed to load adapter module")?
-            .validate(true);
-
-        log::info!(
-            "encoding wasm component for extension {}",
-            extension_dir.display()
-        );
-
-        let component_bytes = encoder
-            .encode()
-            .context("failed to encode wasm component")?;
-
-        let component_bytes = self
-            .strip_custom_sections(&component_bytes)
-            .context("failed to strip debug sections from wasm component")?;
+        let component_bytes = fs::read(&wasm_path).with_context(|| {
+            format!("failed to read component module `{}`", wasm_path.display())
+        })?;
 
         let wasm_extension_api_version =
             parse_wasm_extension_version(&manifest.id, &component_bytes)
@@ -261,55 +231,37 @@ impl ExtensionBuilder {
     }
 
     fn checkout_repo(&self, directory: &Path, url: &str, rev: &str) -> Result<()> {
+        if directory.exists() {
+            return Ok(());
+        }
+
         let git_dir = directory.join(".git");
 
-        if directory.exists() {
-            let remotes_output = util::command::new_std_command("git")
-                .arg("--git-dir")
-                .arg(&git_dir)
-                .args(["remote", "-v"])
-                .output()?;
-            let has_remote = remotes_output.status.success()
-                && String::from_utf8_lossy(&remotes_output.stdout)
-                    .lines()
-                    .any(|line| {
-                        let mut parts = line.split(|c: char| c.is_whitespace());
-                        parts.next() == Some("origin") && parts.any(|part| part == url)
-                    });
-            if !has_remote {
-                bail!(
-                    "grammar directory '{}' already exists, but is not a git clone of '{}'",
-                    directory.display(),
-                    url
-                );
-            }
-        } else {
-            fs::create_dir_all(directory).with_context(|| {
-                format!("failed to create grammar directory {}", directory.display(),)
-            })?;
-            let init_output = util::command::new_std_command("git")
-                .arg("init")
-                .current_dir(directory)
-                .output()?;
-            if !init_output.status.success() {
-                bail!(
-                    "failed to run `git init` in directory '{}'",
-                    directory.display()
-                );
-            }
+        fs::create_dir_all(directory).with_context(|| {
+            format!("failed to create grammar directory {}", directory.display(),)
+        })?;
+        let init_output = util::command::new_std_command("git")
+            .arg("init")
+            .current_dir(directory)
+            .output()?;
+        if !init_output.status.success() {
+            bail!(
+                "failed to run `git init` in directory '{}'",
+                directory.display()
+            );
+        }
 
-            let remote_add_output = util::command::new_std_command("git")
-                .arg("--git-dir")
-                .arg(&git_dir)
-                .args(["remote", "add", "origin", url])
-                .output()
-                .context("failed to execute `git remote add`")?;
-            if !remote_add_output.status.success() {
-                bail!(
-                    "failed to add remote {url} for git repository {}",
-                    git_dir.display()
-                );
-            }
+        let remote_add_output = util::command::new_std_command("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["remote", "add", "origin", url])
+            .output()
+            .context("failed to execute `git remote add`")?;
+        if !remote_add_output.status.success() {
+            bail!(
+                "failed to add remote {url} for git repository {}",
+                git_dir.display()
+            );
         }
 
         let fetch_output = util::command::new_std_command("git")
@@ -379,38 +331,6 @@ impl ExtensionBuilder {
         Ok(())
     }
 
-    async fn install_wasi_preview1_adapter_if_needed(&self) -> Result<Vec<u8>> {
-        let cache_path = self.cache_dir.join("wasi_snapshot_preview1.reactor.wasm");
-        if let Ok(content) = fs::read(&cache_path) {
-            if Parser::is_core_wasm(&content) {
-                return Ok(content);
-            }
-        }
-
-        fs::remove_file(&cache_path).ok();
-
-        log::info!(
-            "downloading wasi adapter module to {}",
-            cache_path.display()
-        );
-        let mut response = self
-            .http
-            .get(WASI_ADAPTER_URL, AsyncBody::default(), true)
-            .await?;
-
-        let mut content = Vec::new();
-        let mut body = BufReader::new(response.body_mut());
-        body.read_to_end(&mut content).await?;
-
-        fs::write(&cache_path, &content)
-            .with_context(|| format!("failed to save file {}", cache_path.display()))?;
-
-        if !Parser::is_core_wasm(&content) {
-            bail!("downloaded wasi adapter is invalid");
-        }
-        Ok(content)
-    }
-
     async fn install_wasi_sdk_if_needed(&self) -> Result<PathBuf> {
         let url = if let Some(asset_name) = WASI_SDK_ASSET_NAME {
             format!("{WASI_SDK_URL}/{asset_name}")
@@ -421,6 +341,7 @@ impl ExtensionBuilder {
         let wasi_sdk_dir = self.cache_dir.join("wasi-sdk");
         let mut clang_path = wasi_sdk_dir.clone();
         clang_path.extend(["bin", &format!("clang{}", env::consts::EXE_SUFFIX)]);
+        log::info!("looking for clang at {}", clang_path.display());
 
         if fs::metadata(&clang_path).map_or(false, |metadata| metadata.is_file()) {
             return Ok(clang_path);
@@ -451,68 +372,6 @@ impl ExtensionBuilder {
         fs::remove_dir_all(&tar_out_dir).ok();
 
         Ok(clang_path)
-    }
-
-    // This was adapted from:
-    // https://github.com/bytecodealliance/wasm-tools/blob/1791a8f139722e9f8679a2bd3d8e423e55132b22/src/bin/wasm-tools/strip.rs
-    fn strip_custom_sections(&self, input: &Vec<u8>) -> Result<Vec<u8>> {
-        use wasmparser::Payload::*;
-
-        let strip_custom_section = |name: &str| name.starts_with(".debug");
-
-        let mut output = Vec::new();
-        let mut stack = Vec::new();
-
-        for payload in Parser::new(0).parse_all(input) {
-            let payload = payload?;
-            let component_header = wasm_encoder::Component::HEADER;
-            let module_header = wasm_encoder::Module::HEADER;
-
-            // Track nesting depth, so that we don't mess with inner producer sections:
-            match payload {
-                Version { encoding, .. } => {
-                    output.extend_from_slice(match encoding {
-                        wasmparser::Encoding::Component => &component_header,
-                        wasmparser::Encoding::Module => &module_header,
-                    });
-                }
-                ModuleSection { .. } | ComponentSection { .. } => {
-                    stack.push(mem::take(&mut output));
-                    continue;
-                }
-                End { .. } => {
-                    let mut parent = match stack.pop() {
-                        Some(c) => c,
-                        None => break,
-                    };
-                    if output.starts_with(&component_header) {
-                        parent.push(ComponentSectionId::Component as u8);
-                        output.encode(&mut parent);
-                    } else {
-                        parent.push(ComponentSectionId::CoreModule as u8);
-                        output.encode(&mut parent);
-                    }
-                    output = parent;
-                }
-                _ => {}
-            }
-
-            if let CustomSection(c) = &payload {
-                if strip_custom_section(c.name()) {
-                    continue;
-                }
-            }
-
-            if let Some((id, range)) = payload.as_section() {
-                RawSection {
-                    id,
-                    data: &input[range],
-                }
-                .append_to(&mut output);
-            }
-        }
-
-        Ok(output)
     }
 }
 
