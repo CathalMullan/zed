@@ -566,7 +566,6 @@ unicode-script = "0.5.7"
 url = "2.2"
 uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
 wasmparser = "0.221"
-wasm-encoder = "0.221"
 wasmtime = { version = "29", default-features = false, features = [
     "async",
     "demangle",
@@ -576,7 +575,6 @@ wasmtime = { version = "29", default-features = false, features = [
 ] }
 wasmtime-wasi = "29"
 which = "6.0.0"
-wit-component = "0.221"
 zed_llm_client = "0.4"
 zstd = "0.11"
 metal = "0.31"
